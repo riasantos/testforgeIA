@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 # ======================
 # CONFIGURAÇÃO GERAL
 # ======================
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_TOKEN = os.getenv("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")
 COPILOT_API_URL = "https://api.githubcopilot.com/chat/completions"
 
 DOCUMENTS_DIR = "Documentações"
@@ -184,4 +184,5 @@ def iniciar_testforge():
 
 if __name__ == "__main__":
     print("🚀 TestForge iniciado...")
+
     iniciar_testforge()
