@@ -1,59 +1,79 @@
 import os
 import json
 import re
-import docx
-import requests
 import logging
+import time
+import traceback
 from pathlib import Path
+
+import docx
+import openai
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Border, Side, Alignment, Font
-from openpyxl.utils import get_column_letter
 
-# Configuração de Logging para ver o que acontece no terminal
+# Configuração de Logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # ======================
 # CONFIGURAÇÃO GERAL
 # ======================
-GITHUB_TOKEN = os.getenv("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")
-COPILOT_API_URL = "https://api.githubcopilot.com/chat/completions"
+# Use OPENAI_API_KEY by default. You can also set GITHUB_TOKEN for other providers.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("GITHUB_TOKEN")
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").lower()  # 'openai' (default) or 'copilot' (custom)
+DOCUMENTS_DIR = os.getenv("DOCUMENTS_DIR", "Documentações")
+EXCEL_OUTPUT = os.getenv("EXCEL_OUTPUT", "cenarios_de_testes.xlsx")
 
-DOCUMENTS_DIR = "Documentações"
-EXCEL_OUTPUT = "cenarios_de_testes.xlsx"
-
-MANUAL_MIN_PER_TEST = 15
-AI_MIN_PER_TEST = 2
+MANUAL_MIN_PER_TEST = int(os.getenv("MANUAL_MIN_PER_TEST", "15"))
+AI_MIN_PER_TEST = int(os.getenv("AI_MIN_PER_TEST", "2"))
 
 # ======================
-# MOTOR DE IA (COPILOT)
+# CONFIGURAÇÃO OPENAI
 # ======================
-def call_copilot(prompt: str) -> str:
-    if not GITHUB_TOKEN:
-        raise RuntimeError("ERRO: GITHUB_TOKEN não configurado nas variáveis de ambiente.")
+if AI_PROVIDER == "openai":
+    if not OPENAI_API_KEY:
+        logging.warning("OPENAI_API_KEY não encontrado nas variáveis de ambiente. A chamada à API falhará sem a chave.")
+    else:
+        openai.api_key = OPENAI_API_KEY
 
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Content-Type": "application/json",
-        "Editor-Version": "vscode/1.80.0",
-    }
+# Endpoint override (if needed)
+AI_API_URL = os.getenv("AI_API_URL", "")
 
-    payload = {
-        "model": "gpt-4",
-        "messages": [
-            {"role": "system", "content": "Você é um Engenheiro de QA Sênior focado em precisão técnica e JSON estruturado."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.1,
-    }
+# ======================
+# MOTOR DE IA
+# ======================
+def call_ai(prompt: str, max_retries: int = 3, backoff_base: float = 2.0) -> str:
+    """Chama o provedor de IA configurado. Retorna conteúdo textual bruto da resposta."""
+    if AI_PROVIDER == "openai":
+        if not openai.api_key:
+            raise RuntimeError("OPENAI_API_KEY não configurado nas variáveis de ambiente.")
 
-    try:
-        response = requests.post(COPILOT_API_URL, headers=headers, json=payload, timeout=90)
-        response.raise_for_status()
-        data = response.json()
-        return data['choices'][0]['message']['content']
-    except Exception as e:
-        logging.error(f"Erro na API Copilot: {e}")
-        raise
+        attempt = 0
+        while True:
+            try:
+                logging.info("🔎 Chamando API do OpenAI...")
+                # Use the Python SDK
+                resp = openai.ChatCompletion.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": "Você é um Engenheiro de QA Sênior focado em precisão técnica e JSON estruturado."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                    max_tokens=3000,
+                )
+                return resp['choices'][0]['message']['content']
+            except Exception as e:
+                attempt += 1
+                logging.error(f"Erro na API (tentativa {attempt}): {e}")
+                if attempt >= max_retries:
+                    logging.debug(traceback.format_exc())
+                    raise
+                sleep_time = backoff_base ** attempt
+                logging.info(f"Aguardando {sleep_time}s antes de nova tentativa...")
+                time.sleep(sleep_time)
+    else:
+        # Placeholder for other providers (ex: GitHub Copilot) - custom implementation required
+        raise NotImplementedError(f"AI_PROVIDER '{AI_PROVIDER}' não implementado. Use 'openai'.")
 
 # =============================================
 # ENGENHARIA DE PROMPT
@@ -68,22 +88,22 @@ Aja como um Lead QA Engineer. Analise os requisitos abaixo e gere um Plano de Te
 4. IDs: TC-FUNC-NNN, TC-NEG-NNN, TC-SEC-NNN.
 
 ### ESTRUTURA DO JSON:
-{{
-  "analise_requisitos": {{ "riscos": [], "entidades": [] }},
+{
+  "analise_requisitos": { "riscos": [], "entidades": [] },
   "cenarios_funcionais": [
-    {{
+    {
       "id": "TC-FUNC-001",
       "titulo": "Título Curto",
       "prioridade": "Alta",
       "descricao": "O que o teste faz",
       "passos": ["1...", "2..."],
       "resultado_esperado": "Resultado verificável"
-    }}
+    }
   ],
   "cenarios_negativos": [],
   "cenarios_borda": [],
-  "metricas_qualidade": {{ "total_casos": 0 }}
-}}
+  "metricas_qualidade": { "total_casos": 0 }
+}
 
 ### REQUISITOS PARA ANÁLISE:
 {requisitos_texto}
@@ -92,26 +112,41 @@ Aja como um Lead QA Engineer. Analise os requisitos abaixo e gere um Plano de Te
 # ======================
 # PROCESSAMENTO DE ARQUIVOS
 # ======================
-def extrair_requisitos_docx(caminho):
+
+def extrair_requisitos_docx(caminho: Path) -> str:
     logging.info(f"📄 Extraindo texto de: {caminho}")
-    doc = docx.Document(caminho)
+    doc = docx.Document(str(caminho))
     conteudo = [para.text.strip() for para in doc.paragraphs if para.text.strip()]
     return "\n".join(conteudo)
 
-def limpar_e_validar_json(texto):
+
+def limpar_e_validar_json(texto: str, doc_stem: str = "response") -> dict:
     texto_limpo = re.sub(r'```json\s*|```', '', texto).strip()
     try:
         return json.loads(texto_limpo)
     except json.JSONDecodeError:
+        # tenta extrair o primeiro objeto JSON
         match = re.search(r'\{.*\}', texto_limpo, re.DOTALL)
         if match:
-            return json.loads(match.group(0))
-        raise
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+        # salva a resposta bruta para inspeção
+        logs_dir = Path(".logs")
+        logs_dir.mkdir(exist_ok=True)
+        raw_path = logs_dir / f"raw_response_{doc_stem}.txt"
+        with raw_path.open("w", encoding="utf-8") as f:
+            f.write(texto)
+        raise RuntimeError(f"Falha ao converter resposta em JSON. Resposta bruta salva em: {raw_path}")
+
 
 def salvar_excel_por_documentos(doc_json_list):
     logging.info("📝 Gerando arquivo Excel final...")
     wb = Workbook()
-    wb.remove(wb.active) # Remove aba padrão
+    # Remove aba padrão se estiver vazia
+    if wb.active and wb.active.title == 'Sheet' and wb.active.max_row == 1 and wb.active.max_column == 1 and wb.active.cell(1, 1).value is None:
+        wb.remove(wb.active)
 
     thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), 
                          top=Side(style='thin'), bottom=Side(style='thin'))
@@ -146,9 +181,12 @@ def salvar_excel_por_documentos(doc_json_list):
                 ws.cell(row=row_num, column=col).alignment = Alignment(wrap_text=True, vertical="top")
 
         # Ajuste de largura das colunas
-        ws.column_dimensions['D'].width = 40
-        ws.column_dimensions['E'].width = 50
-        ws.column_dimensions['F'].width = 40
+        try:
+            ws.column_dimensions['D'].width = 40
+            ws.column_dimensions['E'].width = 50
+            ws.column_dimensions['F'].width = 40
+        except Exception:
+            pass
 
     wb.save(EXCEL_OUTPUT)
     logging.info(f"✨ Sucesso! Planilha gerada: {EXCEL_OUTPUT}")
@@ -156,6 +194,7 @@ def salvar_excel_por_documentos(doc_json_list):
 # ======================
 # EXECUÇÃO PRINCIPAL
 # ======================
+
 def iniciar_testforge():
     # Garante que a pasta de documentações existe
     Path(DOCUMENTS_DIR).mkdir(exist_ok=True)
@@ -163,7 +202,7 @@ def iniciar_testforge():
     docx_files = list(Path(DOCUMENTS_DIR).glob("*.docx"))
     
     if not docx_files:
-        logging.warning(f"⚠️ Nenhum arquivo .docx encontrado na pasta '{DOCUMENTS_DIR}'.")
+        logging.warning(f"⚠️ Nenhum arquivo .docx encontrado na pasta '{DOCUMENTS_DIR}'. Coloque ao menos um arquivo .docx para gerar cenários.")
         return
 
     doc_json_list = []
@@ -171,10 +210,8 @@ def iniciar_testforge():
         try:
             texto = extrair_requisitos_docx(docpath)
             prompt = QA_PROMPT_TEMPLATE.format(requisitos_texto=texto)
-            
-            resposta = call_copilot(prompt)
-            dados_qa = limpar_e_validar_json(resposta)
-            
+            resposta = call_ai(prompt)
+            dados_qa = limpar_e_validar_json(resposta, docpath.stem)
             doc_json_list.append((docpath.stem, dados_qa))
         except Exception as e:
             logging.error(f"❌ Erro ao processar {docpath.name}: {e}")
@@ -182,7 +219,7 @@ def iniciar_testforge():
     if doc_json_list:
         salvar_excel_por_documentos(doc_json_list)
 
+
 if __name__ == "__main__":
     print("🚀 TestForge iniciado...")
-
     iniciar_testforge()
